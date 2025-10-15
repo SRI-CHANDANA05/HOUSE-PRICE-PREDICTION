@@ -1,0 +1,226 @@
+import argparse import os
+from pathlib import Path import joblib
+import time
+import numpy as np import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression
+ 
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# xgboost try:
+from xgboost import XGBRegressor except Exception:
+XGBRegressor = None
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+
+
+def load_dataset(csv_path: Path, target_col: str = "SalePrice"): """
+Load CSV dataset into DataFrame and separate features/target. """
+df = pd.read_csv(csv_path)
+if target_col not in df.columns:
+raise ValueError(f"Target column '{target_col}' not found in dataset columns.")
+X = df.drop(columns=[target_col]) y = df[target_col]
+ 
+return df, X, y
+
+def select_features(df: pd.DataFrame, X: pd.DataFrame): """
+Heuristic feature selection: choose numeric features plus a few categorical features.
+You can customize this function to engineer more features. """
+# numeric features
+numeric_feats = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
+
+# choose top categorical features by unique values < threshold cat_candidates = X.select_dtypes(include=["object",
+"category"]).columns.tolist()
+# pick categorical features with reasonable cardinality cat_feats = [c for c in cat_candidates if df[c].nunique() <= 20] #
+<=20 unique values
+# if none, include a few common ones if len(cat_feats) == 0:
+cat_feats = cat_candidates[:5]
+
+# optional: drop Id if exists if "Id" in numeric_feats:
+numeric_feats.remove("Id")
+ 
+return numeric_feats, cat_feats
+
+
+
+def build_preprocessor(num_feats, cat_feats): """
+Construct ColumnTransformer that imputes/scales numeric features and imputes/one-hot encodes categorical features.
+"""
+numeric_transformer = Pipeline( steps=[
+("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler()),
+]
+)
+
+categorical_transformer = Pipeline( steps=[
+("imputer", SimpleImputer(strategy="most_frequent")),
+("onehot", OneHotEncoder(handle_unknown="ignore", sparse=False)),
+]
+)
+ 
+preprocessor = ColumnTransformer( transformers=[
+("num", numeric_transformer, num_feats), ("cat", categorical_transformer, cat_feats),
+],
+remainder="drop", sparse_threshold=0,
+)
+return preprocessor
+
+
+
+def evaluate_model(name, model, X_test, y_test): preds = model.predict(X_test)
+mae = mean_absolute_error(y_test, preds)
+rmse = np.sqrt(mean_squared_error(y_test, preds)) r2 = r2_score(y_test, preds)
+print(f"\n{name} Performance:") print(f" MAE : {mae:,.2f}")
+print(f" RMSE : {rmse:,.2f}")
+print(f" R2	: {r2:.4f}")
+return {"name": name, "mae": mae, "rmse": rmse, "r2": r2, "preds": preds}
+ 
+def plot_pred_vs_actual(y_test, preds, out_path: Path, title="Prediction vs Actual"):
+plt.figure(figsize=(7, 7)) plt.scatter(y_test, preds, alpha=0.6, s=20)
+lims = [min(y_test.min(), preds.min()), max(y_test.max(), preds.max())]
+plt.plot(lims, lims, "--r") plt.xlabel("Actual SalePrice") plt.ylabel("Predicted SalePrice") plt.title(title)
+plt.tight_layout() plt.savefig(out_path, dpi=200) plt.close()
+
+
+def plot_feature_importances(feature_names, importances, out_path: Path, top_n=20):
+# feature_names: list length equals importances length
+fi = pd.Series(importances, index=feature_names).sort_values(ascending=False).head(top_n)
+plt.figure(figsize=(8, 6)) fi.plot(kind="barh") plt.gca().invert_yaxis() plt.xlabel("Importance") plt.title("Top Feature Importances")
+ 
+plt.tight_layout() plt.savefig(out_path, dpi=200) plt.close()
+
+
+def main(args):
+out_dir = Path(args.output_dir) out_dir.mkdir(parents=True, exist_ok=True)
+
+print("Loading dataset:", args.csv)
+df, X, y = load_dataset(Path(args.csv), target_col=args.target) print(f"Dataset shape: {df.shape}")
+
+# Select features (customize as needed) numeric_feats, cat_feats = select_features(df, X)
+print(f"Numeric features selected: {len(numeric_feats)}")
+print(f"Categorical features selected: {len(cat_feats)} ->
+{cat_feats}")
+
+preprocessor = build_preprocessor(numeric_feats, cat_feats)
+
+# split
+X_train, X_test, y_train, y_test = train_test_split(
+X, y, test_size=args.test_size, random_state=RANDOM_STATE
+ 
+)
+
+# Base models to train models = {}
+
+# Linear Regression pipeline
+pipe_lr = Pipeline(steps=[("preprocessor", preprocessor), ("regressor", LinearRegression())])
+print("\nTraining Linear Regression...") t0 = time.time()
+pipe_lr.fit(X_train, y_train) t_lr = time.time() - t0
+results_lr = evaluate_model("LinearRegression", pipe_lr, X_test, y_test)
+results_lr["time_s"] = t_lr models["LinearRegression"] = (pipe_lr, results_lr)
+
+# Random Forest pipe_rf = Pipeline(
+steps=[("preprocessor", preprocessor), ("regressor", RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=- 1))]
+)
+
+if args.tune:
+ 
+print("\nTuning Random Forest with GridSearchCV (may take time)...")
+param_grid = {
+"regressor	n_estimators": [100, 200],
+"regressor	max_depth": [8, 12, None],
+"regressor	min_samples_split": [2, 5],
+}
+gs = GridSearchCV(pipe_rf, param_grid, cv=5, scoring="neg_mean_squared_error", n_jobs=-1, verbose=1)
+t0 = time.time() gs.fit(X_train, y_train) t_rf_time = time.time() - t0 best_rf = gs.best_estimator_
+print("Best RF params:", gs.best_params_) rf_model = best_rf
+else:
+print("\nTraining Random Forest (default params)...") t0 = time.time()
+pipe_rf.fit(X_train, y_train) t_rf_time = time.time() - t0 rf_model = pipe_rf
+
+results_rf = evaluate_model("RandomForest", rf_model, X_test, y_test)
+results_rf["time_s"] = t_rf_time
+ 
+models["RandomForest"] = (rf_model, results_rf)
+
+# XGBoost (if installed)
+if XGBRegressor is not None: pipe_xgb = Pipeline(
+steps=[("preprocessor", preprocessor), ("regressor", XGBRegressor(random_state=RANDOM_STATE, n_jobs=1, verbosity=0))]
+)
+if args.tune:
+print("\nTuning XGBoost with GridSearchCV (may take time)...")
+param_grid = {
+"regressor	n_estimators": [100, 200],
+"regressor	max_depth": [3, 6],
+"regressor	learning_rate": [0.05, 0.1],
+}
+gs = GridSearchCV(pipe_xgb, param_grid, cv=5, scoring="neg_mean_squared_error", n_jobs=-1, verbose=1)
+t0 = time.time() gs.fit(X_train, y_train) t_xgb_time = time.time() - t0
+print("Best XGB params:", gs.best_params_) xgb_model = gs.best_estimator_
+else:
+ 
+print("\nTraining XGBoost (default params)...") t0 = time.time()
+pipe_xgb.fit(X_train, y_train) t_xgb_time = time.time() - t0 xgb_model = pipe_xgb
+
+results_xgb = evaluate_model("XGBoost", xgb_model, X_test, y_test)
+results_xgb["time_s"] = t_xgb_time models["XGBoost"] = (xgb_model, results_xgb)
+else:
+print("\nXGBoost not installed; skipping XGBoost model. To use it install 'xgboost' package.")
+
+# Save metrics to CSV metrics = []
+for name, (m, r) in models.items():
+metrics.append({"model": name, "mae": r["mae"], "rmse":
+r["rmse"], "r2": r["r2"], "time_s": r.get("time_s", None)})
+metrics_df = pd.DataFrame(metrics).sort_values(by="r2", ascending=False)
+metrics_df.to_csv(out_dir / "model_metrics.csv", index=False) print("\nSaved metrics to:", out_dir / "model_metrics.csv") print(metrics_df)
+ 
+# Save best model (by R2) best_row = metrics_df.iloc[0] best_name = best_row["model"]
+best_model = models[best_name][0]
+joblib.dump(best_model, out_dir / f"best_model_{best_name}.joblib")
+print(f"Saved best model ({best_name}) to: {out_dir / f'best_model_{best_name}.joblib'}")
+
+# plots: prediction vs actual for each model for name, (m, r) in models.items():
+preds = r["preds"]
+plot_pred_vs_actual(y_test, preds, out_dir / f"pred_vs_actual_{name}.png", title=f"{name} Pred vs Actual")
+print(f"Saved pred vs actual plot for {name}")
+
+# Feature importance for tree-based models
+# Need to extract feature names after preprocessing # Fit preprocessor separately to get feature_names preprocessor.fit(X_train)
+# numeric feat names + onehot names
+numeric_feats = preprocessor.transformers_[0][2] cat_ohe =
+preprocessor.transformers_[1][1].named_steps["onehot"] try:
+ 
+cat_feats = preprocessor.transformers_[1][2]
+ohe_feat_names = cat_ohe.get_feature_names_out(cat_feats).tolist()
+except Exception: ohe_feat_names = []
+
+feature_names = list(numeric_feats) + ohe_feat_names
+
+# RandomForest feature importances if "RandomForest" in models:
+rf = models["RandomForest"][0].named_steps["regressor"] try:
+importances = rf.feature_importances_
+plot_feature_importances(feature_names, importances, out_dir / "rf_feature_importance.png", top_n=25)
+print("Saved RandomForest feature importance plot.") except Exception as e:
+print("Could not plot RF importances:", e)
+
+if "XGBoost" in models and XGBRegressor is not None: xgb = models["XGBoost"][0].named_steps["regressor"] try:
+importances = xgb.feature_importances_
+plot_feature_importances(feature_names, importances, out_dir / "xgb_feature_importance.png", top_n=25)
+ 
+print("Saved XGBoost feature importance plot.") except Exception as e:
+print("Could not plot XGB importances:", e) print("\nAll done. Outputs saved to:", out_dir)
+
+if 	name	== "	main	":
+parser = argparse.ArgumentParser(description="House Price Prediction - training script")
+parser.add_argument("--csv", type=str, required=True, help="Path to dataset CSV (must include target column)")
+parser.add_argument("--target", type=str, default="SalePrice", help="Name of target column in CSV")
+parser.add_argument("--output-dir", type=str, default="output", help="Directory to save outputs")
+parser.add_argument("--test-size", type=float, default=0.2, help="Test set fraction")
+parser.add_argument("--tune", action="store_true", help="Perform GridSearch hyperparameter tuning (slower)")
+args = parser.parse_args() main(args)
