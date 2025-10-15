@@ -1,4 +1,4 @@
-HOUSE PRICE PREDICTION
+HOUSE PRICE PREDICTION                              
 The House Price Prediction project aims to develop a machine learning model that can accurately estimate the market price of a house based on various features such as location, area, number of bedrooms, bathrooms, amenities, and other property-related parameters. The project utilizes historical housing data to identify patterns and relationships between these factors and housing prices.
 
 The main goal is to create a predictive system that assists buyers, sellers, and real estate agencies in making informed decisions. By leveraging data science and regression models, the project helps forecast property prices with high accuracy, reducing uncertainty in real estate transactions
