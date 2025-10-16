@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>House Price Prediction</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+</head>
+<body class="bg-light">
+  <div class="container mt-5 p-4 bg-white shadow rounded">
+    <h2 class="text-center mb-4 text-primary">🏠 House Price Prediction</h2>
+
+    <form action="/predict" method="post">
+      <div class="mb-3">
+        <label for="area" class="form-label">Area (in sq.ft)</label>
+        <input type="number" class="form-control" name="area" required>
+      </div>
+
+      <div class="mb-3">
+        <label for="bedrooms" class="form-label">Number of Bedrooms</label>
+        <input type="number" class="form-control" name="bedrooms" required>
+      </div>
+
+      <div class="mb-3">
+        <label for="bathrooms" class="form-label">Number of Bathrooms</label>
+        <input type="number" class="form-control" name="bathrooms" required>
+      </div>
+
+      <div class="mb-3">
+        <label for="location_score" class="form-label">Location Score (1-10)</label>
+        <input type="number" step="0.1" class="form-control" name="location_score" required>
+      </div>
+
+      <button type="submit" class="btn btn-primary w-100">Predict Price</button>
+    </form>
+
+    {% if prediction_text %}
+      <div class="alert alert-success text-center mt-4">
+        {{ prediction_text }}
+      </div>
+    {% endif %}
+  </div>
+</body>
+</html>
