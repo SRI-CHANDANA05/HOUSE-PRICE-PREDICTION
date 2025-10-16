@@ -1,0 +1,357 @@
+
+import os
+import re
+import glob
+import argparse
+import joblib
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+from email import policy
+from email.parser import BytesParser
+from typing import List, Tuple
+
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    classification_report,
+)
+
+# NLP
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+
+# Ensure necessary NLTK data is downloaded
+nltk_download_needed = False
+try:
+    _ = stopwords.words("english")
+    _ = WordNetLemmatizer()
+except Exception:
+    nltk_download_needed = True
+
+if nltk_download_needed:
+    nltk.download("stopwords")
+    nltk.download("punkt")
+    nltk.download("wordnet")
+    nltk.download("omw-1.4")
+
+STOPWORDS = set(stopwords.words("english"))
+LEMMATIZER = WordNetLemmatizer()
+
+SEED = 42
+np.random.seed(SEED)
+
+
+def read_eml_file(path: Path) -> str:
+    """Parse .eml file and return plain text (subject + body)."""
+    try:
+        with open(path, "rb") as f:
+            msg = BytesParser(policy=policy.default).parse(f)
+        parts = []
+        subj = msg.get("subject", "")
+        if subj:
+            parts.append(str(subj))
+        # prefer plain text payloads
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                if ctype == "text/plain":
+                    try:
+                        parts.append(part.get_payload(decode=True).decode(errors="ignore"))
+                    except Exception:
+                        continue
+        else:
+            try:
+                parts.append(msg.get_payload(decode=True).decode(errors="ignore"))
+            except Exception:
+                parts.append(str(msg.get_payload()))
+        return "\n".join(parts)
+    except Exception:
+        # Fallback: read as text
+        try:
+            return path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+
+def read_text_file(path: Path) -> str:
+    """Read a plain text file."""
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def load_dataset_from_folders(base_dir: str) -> Tuple[List[str], List[int]]:
+    """
+    Load dataset assuming directory structure:
+      base_dir/
+         ham/   -> contains ham emails (.eml or .txt)
+         spam/  -> contains spam emails (.eml or .txt)
+    Returns texts, labels (0 for ham, 1 for spam)
+    """
+    base = Path(base_dir)
+    ham_dir = base / "ham"
+    spam_dir = base / "spam"
+    texts = []
+    labels = []
+
+    if not ham_dir.exists() or not spam_dir.exists():
+        raise FileNotFoundError(
+            f"Expected directories '{ham_dir}' and '{spam_dir}' to exist. "
+            "Place the SpamAssassin (or other) dataset files there."
+        )
+
+    def process_dir(dpath: Path, label: int):
+        for ext in ("*.eml", "*.txt", "*.mail", "*.msg"):
+            for p in dpath.glob(ext):
+                if p.suffix.lower() == ".eml":
+                    txt = read_eml_file(p)
+                else:
+                    txt = read_text_file(p)
+                if txt and txt.strip():
+                    texts.append(txt)
+                    labels.append(label)
+
+    process_dir(ham_dir, 0)
+    process_dir(spam_dir, 1)
+    return texts, labels
+
+
+# --- Preprocessing utilities ---
+
+RE_HTML = re.compile(r"<[^>]+>")
+RE_NON_ALPHANUM = re.compile(r"[^\w\s]")  # keep underscores as word chars but OK
+
+
+def clean_text(text: str) -> str:
+    """Basic cleaning: remove html, lower, remove non-alpha, collapse spaces."""
+    if not text:
+        return ""
+    text = RE_HTML.sub(" ", text)
+    text = text.lower()
+    text = text.replace("\r", " ").replace("\n", " ")
+    # Remove long header-like tokens "from:" "to:" "subject:" at start patterns
+    text = re.sub(r"\b(from|to|subject|cc|bcc):\s*\S+", " ", text)
+    # Remove URLs and email addresses
+    text = re.sub(r"\S+@\S+", " ", text)
+    text = re.sub(r"http\S+|www\.\S+", " ", text)
+    # Replace non-alphanumeric (except whitespace) with space
+    text = RE_NON_ALPHANUM.sub(" ", text)
+    # Collapse spaces
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def tokenize_lemmatize(text: str) -> List[str]:
+    """Tokenize and lemmatize, remove stopwords and short tokens."""
+    from nltk.tokenize import word_tokenize
+
+    tokens = word_tokenize(text)
+    output = []
+    for t in tokens:
+        if len(t) < 2:
+            continue
+        if t in STOPWORDS:
+            continue
+        lemma = LEMMATIZER.lemmatize(t)
+        output.append(lemma)
+    return output
+
+
+def preprocess_texts(texts: List[str]) -> List[str]:
+    """Apply cleaning + tokenization/lemmatization and re-join tokens to a string (for TF-IDF)."""
+    processed = []
+    for t in texts:
+        c = clean_text(t)
+        tok = tokenize_lemmatize(c)
+        processed.append(" ".join(tok))
+    return processed
+
+
+# --- Training / evaluation pipeline ---
+
+def train_and_evaluate(X_train_vec, X_test_vec, y_train, y_test, do_gridsearch=True):
+    results = {}
+
+    # Naive Bayes
+    nb = MultinomialNB()
+    t0 = time.time()
+    nb.fit(X_train_vec, y_train)
+    t_nb = time.time() - t0
+    ypred_nb = nb.predict(X_test_vec)
+    results["NaiveBayes"] = {
+        "model": nb,
+        "time_s": t_nb,
+        "accuracy": accuracy_score(y_test, ypred_nb),
+        "precision": precision_score(y_test, ypred_nb),
+        "recall": recall_score(y_test, ypred_nb),
+        "f1": f1_score(y_test, ypred_nb),
+        "y_pred": ypred_nb,
+    }
+
+    # Logistic Regression (with small grid)
+    lr = LogisticRegression(solver="liblinear", random_state=SEED, max_iter=1000)
+    if do_gridsearch:
+        param_grid = {"C": [0.01, 0.1, 1.0, 5.0]}
+        gs = GridSearchCV(lr, param_grid, cv=5, scoring="f1", n_jobs=-1)
+        t0 = time.time()
+        gs.fit(X_train_vec, y_train)
+        t_lr = time.time() - t0
+        best_lr = gs.best_estimator_
+    else:
+        t0 = time.time()
+        lr.fit(X_train_vec, y_train)
+        t_lr = time.time() - t0
+        best_lr = lr
+
+    ypred_lr = best_lr.predict(X_test_vec)
+    results["LogisticRegression"] = {
+        "model": best_lr,
+        "time_s": t_lr,
+        "accuracy": accuracy_score(y_test, ypred_lr),
+        "precision": precision_score(y_test, ypred_lr),
+        "recall": recall_score(y_test, ypred_lr),
+        "f1": f1_score(y_test, ypred_lr),
+        "y_pred": ypred_lr,
+    }
+
+    # SVM (LinearSVC)
+    svm = LinearSVC(random_state=SEED, max_iter=5000)
+    if do_gridsearch:
+        param_grid = {"C": [0.01, 0.1, 1.0, 5.0]}
+        gs = GridSearchCV(svm, param_grid, cv=5, scoring="f1", n_jobs=-1)
+        t0 = time.time()
+        gs.fit(X_train_vec, y_train)
+        t_svm = time.time() - t0
+        best_svm = gs.best_estimator_
+    else:
+        t0 = time.time()
+        svm.fit(X_train_vec, y_train)
+        t_svm = time.time() - t0
+        best_svm = svm
+
+    ypred_svm = best_svm.predict(X_test_vec)
+    results["SVM"] = {
+        "model": best_svm,
+        "time_s": t_svm,
+        "accuracy": accuracy_score(y_test, ypred_svm),
+        "precision": precision_score(y_test, ypred_svm),
+        "recall": recall_score(y_test, ypred_svm),
+        "f1": f1_score(y_test, ypred_svm),
+        "y_pred": ypred_svm,
+    }
+
+    return results
+
+
+def print_and_plot_results(results: dict, y_test, out_dir: str):
+    # Print table and classification reports
+    print("\n=== Model Results ===")
+    for name, r in results.items():
+        print(f"\nModel: {name}")
+        print(f" Train/Test Time (s): {r['time_s']:.3f}")
+        print(f" Accuracy: {r['accuracy']:.4f}")
+        print(f" Precision: {r['precision']:.4f}")
+        print(f" Recall: {r['recall']:.4f}")
+        print(f" F1-score: {r['f1']:.4f}")
+        print(" Confusion Matrix:")
+        print(confusion_matrix(y_test, r["y_pred"]))
+        print(" Classification Report:")
+        print(classification_report(y_test, r["y_pred"], digits=4))
+
+    # Bar chart of accuracy
+    names = list(results.keys())
+    accs = [results[n]["accuracy"] * 100.0 for n in names]
+
+    plt.figure(figsize=(7, 4))
+    bars = plt.bar(names, accs)
+    plt.ylim(0, 100)
+    plt.ylabel("Accuracy (%)")
+    plt.title("Model Accuracy Comparison")
+    for bar, acc in zip(bars, accs):
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 1,
+            f"{acc:.1f}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+    out_path = Path(out_dir) / "model_accuracy_comparison.png"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+    print(f"\nSaved accuracy bar chart to: {out_path}")
+
+
+def save_best_model(results: dict, out_dir: str):
+    # choose best by F1
+    best_name = max(results.keys(), key=lambda n: results[n]["f1"])
+    best_model = results[best_name]["model"]
+    model_path = Path(out_dir) / f"best_model_{best_name}.joblib"
+    joblib.dump(best_model, model_path)
+    print(f"Saved best model ({best_name}) to: {model_path}")
+    return model_path
+
+
+def main(args):
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Loading dataset from:", args.data_dir)
+    texts, labels = load_dataset_from_folders(args.data_dir)
+    print(f"Loaded {len(texts)} emails ({sum(labels)} spam, {len(labels)-sum(labels)} ham)")
+
+    print("Preprocessing texts...")
+    X = preprocess_texts(texts)
+    y = np.array(labels)
+
+    print("Splitting data...")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=args.test_size, random_state=SEED, stratify=y
+    )
+
+    print("Vectorizing with TF-IDF (max_features=%d)..." % args.max_features)
+    vectorizer = TfidfVectorizer(max_features=args.max_features, ngram_range=(1, 2))
+    X_train_vec = vectorizer.fit_transform(X_train)
+    X_test_vec = vectorizer.transform(X_test)
+
+    # Save vectorizer
+    joblib.dump(vectorizer, out_dir / "tfidf_vectorizer.joblib")
+    print("Saved TF-IDF vectorizer.")
+
+    print("Training and evaluating models...")
+    results = train_and_evaluate(X_train_vec, X_test_vec, y_train, y_test, do_gridsearch=not args.no_grid)
+
+    print_and_plot_results(results, y_test, out_dir)
+    best_model_path = save_best_model(results, out_dir)
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Email Spam Detection - training script")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="data",
+        help="Base data directory containing 'ham' and 'spam' subfolders with .eml/.txt files",
+    )
+    parser.add_argument("--output-dir", type=str, default="output", help="Directory to save models and plots")
+    parser.add_argument("--test-size", type=float, default=0.20, help="Test split fraction")
+    parser.add_argument("--max-features", type=int, default=3000, help="Max features for TF-IDF")
+    parser.add_argument("--no-grid", action="store_true", help="Disable GridSearch (faster)")
+    args = parser.parse_args()
+    main(args)
