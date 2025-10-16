@@ -1,226 +1,358 @@
-import argparse import os
-from pathlib import Path import joblib
+
+
+import os
+import re
+import glob
+import argparse
+import joblib
 import time
-import numpy as np import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 
+from pathlib import Path
+from email import policy
+from email.parser import BytesParser
+from typing import List, Tuple
+
 from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LinearRegression
- 
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
-# xgboost try:
-from xgboost import XGBRegressor except Exception:
-XGBRegressor = None
-
-RANDOM_STATE = 42
-np.random.seed(RANDOM_STATE)
-
-
-
-def load_dataset(csv_path: Path, target_col: str = "SalePrice"): """
-Load CSV dataset into DataFrame and separate features/target. """
-df = pd.read_csv(csv_path)
-if target_col not in df.columns:
-raise ValueError(f"Target column '{target_col}' not found in dataset columns.")
-X = df.drop(columns=[target_col]) y = df[target_col]
- 
-return df, X, y
-
-def select_features(df: pd.DataFrame, X: pd.DataFrame): """
-Heuristic feature selection: choose numeric features plus a few categorical features.
-You can customize this function to engineer more features. """
-# numeric features
-numeric_feats = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
-
-# choose top categorical features by unique values < threshold cat_candidates = X.select_dtypes(include=["object",
-"category"]).columns.tolist()
-# pick categorical features with reasonable cardinality cat_feats = [c for c in cat_candidates if df[c].nunique() <= 20] #
-<=20 unique values
-# if none, include a few common ones if len(cat_feats) == 0:
-cat_feats = cat_candidates[:5]
-
-# optional: drop Id if exists if "Id" in numeric_feats:
-numeric_feats.remove("Id")
- 
-return numeric_feats, cat_feats
-
-
-
-def build_preprocessor(num_feats, cat_feats): """
-Construct ColumnTransformer that imputes/scales numeric features and imputes/one-hot encodes categorical features.
-"""
-numeric_transformer = Pipeline( steps=[
-("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler()),
-]
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    classification_report,
 )
 
-categorical_transformer = Pipeline( steps=[
-("imputer", SimpleImputer(strategy="most_frequent")),
-("onehot", OneHotEncoder(handle_unknown="ignore", sparse=False)),
-]
-)
- 
-preprocessor = ColumnTransformer( transformers=[
-("num", numeric_transformer, num_feats), ("cat", categorical_transformer, cat_feats),
-],
-remainder="drop", sparse_threshold=0,
-)
-return preprocessor
+# NLP
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+
+# Ensure necessary NLTK data is downloaded
+nltk_download_needed = False
+try:
+    _ = stopwords.words("english")
+    _ = WordNetLemmatizer()
+except Exception:
+    nltk_download_needed = True
+
+if nltk_download_needed:
+    nltk.download("stopwords")
+    nltk.download("punkt")
+    nltk.download("wordnet")
+    nltk.download("omw-1.4")
+
+STOPWORDS = set(stopwords.words("english"))
+LEMMATIZER = WordNetLemmatizer()
+
+SEED = 42
+np.random.seed(SEED)
 
 
+def read_eml_file(path: Path) -> str:
+    """Parse .eml file and return plain text (subject + body)."""
+    try:
+        with open(path, "rb") as f:
+            msg = BytesParser(policy=policy.default).parse(f)
+        parts = []
+        subj = msg.get("subject", "")
+        if subj:
+            parts.append(str(subj))
+        # prefer plain text payloads
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                if ctype == "text/plain":
+                    try:
+                        parts.append(part.get_payload(decode=True).decode(errors="ignore"))
+                    except Exception:
+                        continue
+        else:
+            try:
+                parts.append(msg.get_payload(decode=True).decode(errors="ignore"))
+            except Exception:
+                parts.append(str(msg.get_payload()))
+        return "\n".join(parts)
+    except Exception:
+        # Fallback: read as text
+        try:
+            return path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return ""
 
-def evaluate_model(name, model, X_test, y_test): preds = model.predict(X_test)
-mae = mean_absolute_error(y_test, preds)
-rmse = np.sqrt(mean_squared_error(y_test, preds)) r2 = r2_score(y_test, preds)
-print(f"\n{name} Performance:") print(f" MAE : {mae:,.2f}")
-print(f" RMSE : {rmse:,.2f}")
-print(f" R2	: {r2:.4f}")
-return {"name": name, "mae": mae, "rmse": rmse, "r2": r2, "preds": preds}
- 
-def plot_pred_vs_actual(y_test, preds, out_path: Path, title="Prediction vs Actual"):
-plt.figure(figsize=(7, 7)) plt.scatter(y_test, preds, alpha=0.6, s=20)
-lims = [min(y_test.min(), preds.min()), max(y_test.max(), preds.max())]
-plt.plot(lims, lims, "--r") plt.xlabel("Actual SalePrice") plt.ylabel("Predicted SalePrice") plt.title(title)
-plt.tight_layout() plt.savefig(out_path, dpi=200) plt.close()
+
+def read_text_file(path: Path) -> str:
+    """Read a plain text file."""
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
 
 
-def plot_feature_importances(feature_names, importances, out_path: Path, top_n=20):
-# feature_names: list length equals importances length
-fi = pd.Series(importances, index=feature_names).sort_values(ascending=False).head(top_n)
-plt.figure(figsize=(8, 6)) fi.plot(kind="barh") plt.gca().invert_yaxis() plt.xlabel("Importance") plt.title("Top Feature Importances")
- 
-plt.tight_layout() plt.savefig(out_path, dpi=200) plt.close()
+def load_dataset_from_folders(base_dir: str) -> Tuple[List[str], List[int]]:
+    """
+    Load dataset assuming directory structure:
+      base_dir/
+         ham/   -> contains ham emails (.eml or .txt)
+         spam/  -> contains spam emails (.eml or .txt)
+    Returns texts, labels (0 for ham, 1 for spam)
+    """
+    base = Path(base_dir)
+    ham_dir = base / "ham"
+    spam_dir = base / "spam"
+    texts = []
+    labels = []
+
+    if not ham_dir.exists() or not spam_dir.exists():
+        raise FileNotFoundError(
+            f"Expected directories '{ham_dir}' and '{spam_dir}' to exist. "
+            "Place the SpamAssassin (or other) dataset files there."
+        )
+
+    def process_dir(dpath: Path, label: int):
+        for ext in ("*.eml", "*.txt", "*.mail", "*.msg"):
+            for p in dpath.glob(ext):
+                if p.suffix.lower() == ".eml":
+                    txt = read_eml_file(p)
+                else:
+                    txt = read_text_file(p)
+                if txt and txt.strip():
+                    texts.append(txt)
+                    labels.append(label)
+
+    process_dir(ham_dir, 0)
+    process_dir(spam_dir, 1)
+    return texts, labels
+
+
+# --- Preprocessing utilities ---
+
+RE_HTML = re.compile(r"<[^>]+>")
+RE_NON_ALPHANUM = re.compile(r"[^\w\s]")  # keep underscores as word chars but OK
+
+
+def clean_text(text: str) -> str:
+    """Basic cleaning: remove html, lower, remove non-alpha, collapse spaces."""
+    if not text:
+        return ""
+    text = RE_HTML.sub(" ", text)
+    text = text.lower()
+    text = text.replace("\r", " ").replace("\n", " ")
+    # Remove long header-like tokens "from:" "to:" "subject:" at start patterns
+    text = re.sub(r"\b(from|to|subject|cc|bcc):\s*\S+", " ", text)
+    # Remove URLs and email addresses
+    text = re.sub(r"\S+@\S+", " ", text)
+    text = re.sub(r"http\S+|www\.\S+", " ", text)
+    # Replace non-alphanumeric (except whitespace) with space
+    text = RE_NON_ALPHANUM.sub(" ", text)
+    # Collapse spaces
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def tokenize_lemmatize(text: str) -> List[str]:
+    """Tokenize and lemmatize, remove stopwords and short tokens."""
+    from nltk.tokenize import word_tokenize
+
+    tokens = word_tokenize(text)
+    output = []
+    for t in tokens:
+        if len(t) < 2:
+            continue
+        if t in STOPWORDS:
+            continue
+        lemma = LEMMATIZER.lemmatize(t)
+        output.append(lemma)
+    return output
+
+
+def preprocess_texts(texts: List[str]) -> List[str]:
+    """Apply cleaning + tokenization/lemmatization and re-join tokens to a string (for TF-IDF)."""
+    processed = []
+    for t in texts:
+        c = clean_text(t)
+        tok = tokenize_lemmatize(c)
+        processed.append(" ".join(tok))
+    return processed
+
+
+# --- Training / evaluation pipeline ---
+
+def train_and_evaluate(X_train_vec, X_test_vec, y_train, y_test, do_gridsearch=True):
+    results = {}
+
+    # Naive Bayes
+    nb = MultinomialNB()
+    t0 = time.time()
+    nb.fit(X_train_vec, y_train)
+    t_nb = time.time() - t0
+    ypred_nb = nb.predict(X_test_vec)
+    results["NaiveBayes"] = {
+        "model": nb,
+        "time_s": t_nb,
+        "accuracy": accuracy_score(y_test, ypred_nb),
+        "precision": precision_score(y_test, ypred_nb),
+        "recall": recall_score(y_test, ypred_nb),
+        "f1": f1_score(y_test, ypred_nb),
+        "y_pred": ypred_nb,
+    }
+
+    # Logistic Regression (with small grid)
+    lr = LogisticRegression(solver="liblinear", random_state=SEED, max_iter=1000)
+    if do_gridsearch:
+        param_grid = {"C": [0.01, 0.1, 1.0, 5.0]}
+        gs = GridSearchCV(lr, param_grid, cv=5, scoring="f1", n_jobs=-1)
+        t0 = time.time()
+        gs.fit(X_train_vec, y_train)
+        t_lr = time.time() - t0
+        best_lr = gs.best_estimator_
+    else:
+        t0 = time.time()
+        lr.fit(X_train_vec, y_train)
+        t_lr = time.time() - t0
+        best_lr = lr
+
+    ypred_lr = best_lr.predict(X_test_vec)
+    results["LogisticRegression"] = {
+        "model": best_lr,
+        "time_s": t_lr,
+        "accuracy": accuracy_score(y_test, ypred_lr),
+        "precision": precision_score(y_test, ypred_lr),
+        "recall": recall_score(y_test, ypred_lr),
+        "f1": f1_score(y_test, ypred_lr),
+        "y_pred": ypred_lr,
+    }
+
+    # SVM (LinearSVC)
+    svm = LinearSVC(random_state=SEED, max_iter=5000)
+    if do_gridsearch:
+        param_grid = {"C": [0.01, 0.1, 1.0, 5.0]}
+        gs = GridSearchCV(svm, param_grid, cv=5, scoring="f1", n_jobs=-1)
+        t0 = time.time()
+        gs.fit(X_train_vec, y_train)
+        t_svm = time.time() - t0
+        best_svm = gs.best_estimator_
+    else:
+        t0 = time.time()
+        svm.fit(X_train_vec, y_train)
+        t_svm = time.time() - t0
+        best_svm = svm
+
+    ypred_svm = best_svm.predict(X_test_vec)
+    results["SVM"] = {
+        "model": best_svm,
+        "time_s": t_svm,
+        "accuracy": accuracy_score(y_test, ypred_svm),
+        "precision": precision_score(y_test, ypred_svm),
+        "recall": recall_score(y_test, ypred_svm),
+        "f1": f1_score(y_test, ypred_svm),
+        "y_pred": ypred_svm,
+    }
+
+    return results
+
+
+def print_and_plot_results(results: dict, y_test, out_dir: str):
+    # Print table and classification reports
+    print("\n=== Model Results ===")
+    for name, r in results.items():
+        print(f"\nModel: {name}")
+        print(f" Train/Test Time (s): {r['time_s']:.3f}")
+        print(f" Accuracy: {r['accuracy']:.4f}")
+        print(f" Precision: {r['precision']:.4f}")
+        print(f" Recall: {r['recall']:.4f}")
+        print(f" F1-score: {r['f1']:.4f}")
+        print(" Confusion Matrix:")
+        print(confusion_matrix(y_test, r["y_pred"]))
+        print(" Classification Report:")
+        print(classification_report(y_test, r["y_pred"], digits=4))
+
+    # Bar chart of accuracy
+    names = list(results.keys())
+    accs = [results[n]["accuracy"] * 100.0 for n in names]
+
+    plt.figure(figsize=(7, 4))
+    bars = plt.bar(names, accs)
+    plt.ylim(0, 100)
+    plt.ylabel("Accuracy (%)")
+    plt.title("Model Accuracy Comparison")
+    for bar, acc in zip(bars, accs):
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 1,
+            f"{acc:.1f}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+    out_path = Path(out_dir) / "model_accuracy_comparison.png"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+    print(f"\nSaved accuracy bar chart to: {out_path}")
+
+
+def save_best_model(results: dict, out_dir: str):
+    # choose best by F1
+    best_name = max(results.keys(), key=lambda n: results[n]["f1"])
+    best_model = results[best_name]["model"]
+    model_path = Path(out_dir) / f"best_model_{best_name}.joblib"
+    joblib.dump(best_model, model_path)
+    print(f"Saved best model ({best_name}) to: {model_path}")
+    return model_path
 
 
 def main(args):
-out_dir = Path(args.output_dir) out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-print("Loading dataset:", args.csv)
-df, X, y = load_dataset(Path(args.csv), target_col=args.target) print(f"Dataset shape: {df.shape}")
+    print("Loading dataset from:", args.data_dir)
+    texts, labels = load_dataset_from_folders(args.data_dir)
+    print(f"Loaded {len(texts)} emails ({sum(labels)} spam, {len(labels)-sum(labels)} ham)")
 
-# Select features (customize as needed) numeric_feats, cat_feats = select_features(df, X)
-print(f"Numeric features selected: {len(numeric_feats)}")
-print(f"Categorical features selected: {len(cat_feats)} ->
-{cat_feats}")
+    print("Preprocessing texts...")
+    X = preprocess_texts(texts)
+    y = np.array(labels)
 
-preprocessor = build_preprocessor(numeric_feats, cat_feats)
+    print("Splitting data...")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=args.test_size, random_state=SEED, stratify=y
+    )
 
-# split
-X_train, X_test, y_train, y_test = train_test_split(
-X, y, test_size=args.test_size, random_state=RANDOM_STATE
- 
-)
+    print("Vectorizing with TF-IDF (max_features=%d)..." % args.max_features)
+    vectorizer = TfidfVectorizer(max_features=args.max_features, ngram_range=(1, 2))
+    X_train_vec = vectorizer.fit_transform(X_train)
+    X_test_vec = vectorizer.transform(X_test)
 
-# Base models to train models = {}
+    # Save vectorizer
+    joblib.dump(vectorizer, out_dir / "tfidf_vectorizer.joblib")
+    print("Saved TF-IDF vectorizer.")
 
-# Linear Regression pipeline
-pipe_lr = Pipeline(steps=[("preprocessor", preprocessor), ("regressor", LinearRegression())])
-print("\nTraining Linear Regression...") t0 = time.time()
-pipe_lr.fit(X_train, y_train) t_lr = time.time() - t0
-results_lr = evaluate_model("LinearRegression", pipe_lr, X_test, y_test)
-results_lr["time_s"] = t_lr models["LinearRegression"] = (pipe_lr, results_lr)
+    print("Training and evaluating models...")
+    results = train_and_evaluate(X_train_vec, X_test_vec, y_train, y_test, do_gridsearch=not args.no_grid)
 
-# Random Forest pipe_rf = Pipeline(
-steps=[("preprocessor", preprocessor), ("regressor", RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=- 1))]
-)
+    print_and_plot_results(results, y_test, out_dir)
+    best_model_path = save_best_model(results, out_dir)
 
-if args.tune:
- 
-print("\nTuning Random Forest with GridSearchCV (may take time)...")
-param_grid = {
-"regressor	n_estimators": [100, 200],
-"regressor	max_depth": [8, 12, None],
-"regressor	min_samples_split": [2, 5],
-}
-gs = GridSearchCV(pipe_rf, param_grid, cv=5, scoring="neg_mean_squared_error", n_jobs=-1, verbose=1)
-t0 = time.time() gs.fit(X_train, y_train) t_rf_time = time.time() - t0 best_rf = gs.best_estimator_
-print("Best RF params:", gs.best_params_) rf_model = best_rf
-else:
-print("\nTraining Random Forest (default params)...") t0 = time.time()
-pipe_rf.fit(X_train, y_train) t_rf_time = time.time() - t0 rf_model = pipe_rf
+    print("\nDone.")
 
-results_rf = evaluate_model("RandomForest", rf_model, X_test, y_test)
-results_rf["time_s"] = t_rf_time
- 
-models["RandomForest"] = (rf_model, results_rf)
 
-# XGBoost (if installed)
-if XGBRegressor is not None: pipe_xgb = Pipeline(
-steps=[("preprocessor", preprocessor), ("regressor", XGBRegressor(random_state=RANDOM_STATE, n_jobs=1, verbosity=0))]
-)
-if args.tune:
-print("\nTuning XGBoost with GridSearchCV (may take time)...")
-param_grid = {
-"regressor	n_estimators": [100, 200],
-"regressor	max_depth": [3, 6],
-"regressor	learning_rate": [0.05, 0.1],
-}
-gs = GridSearchCV(pipe_xgb, param_grid, cv=5, scoring="neg_mean_squared_error", n_jobs=-1, verbose=1)
-t0 = time.time() gs.fit(X_train, y_train) t_xgb_time = time.time() - t0
-print("Best XGB params:", gs.best_params_) xgb_model = gs.best_estimator_
-else:
- 
-print("\nTraining XGBoost (default params)...") t0 = time.time()
-pipe_xgb.fit(X_train, y_train) t_xgb_time = time.time() - t0 xgb_model = pipe_xgb
-
-results_xgb = evaluate_model("XGBoost", xgb_model, X_test, y_test)
-results_xgb["time_s"] = t_xgb_time models["XGBoost"] = (xgb_model, results_xgb)
-else:
-print("\nXGBoost not installed; skipping XGBoost model. To use it install 'xgboost' package.")
-
-# Save metrics to CSV metrics = []
-for name, (m, r) in models.items():
-metrics.append({"model": name, "mae": r["mae"], "rmse":
-r["rmse"], "r2": r["r2"], "time_s": r.get("time_s", None)})
-metrics_df = pd.DataFrame(metrics).sort_values(by="r2", ascending=False)
-metrics_df.to_csv(out_dir / "model_metrics.csv", index=False) print("\nSaved metrics to:", out_dir / "model_metrics.csv") print(metrics_df)
- 
-# Save best model (by R2) best_row = metrics_df.iloc[0] best_name = best_row["model"]
-best_model = models[best_name][0]
-joblib.dump(best_model, out_dir / f"best_model_{best_name}.joblib")
-print(f"Saved best model ({best_name}) to: {out_dir / f'best_model_{best_name}.joblib'}")
-
-# plots: prediction vs actual for each model for name, (m, r) in models.items():
-preds = r["preds"]
-plot_pred_vs_actual(y_test, preds, out_dir / f"pred_vs_actual_{name}.png", title=f"{name} Pred vs Actual")
-print(f"Saved pred vs actual plot for {name}")
-
-# Feature importance for tree-based models
-# Need to extract feature names after preprocessing # Fit preprocessor separately to get feature_names preprocessor.fit(X_train)
-# numeric feat names + onehot names
-numeric_feats = preprocessor.transformers_[0][2] cat_ohe =
-preprocessor.transformers_[1][1].named_steps["onehot"] try:
- 
-cat_feats = preprocessor.transformers_[1][2]
-ohe_feat_names = cat_ohe.get_feature_names_out(cat_feats).tolist()
-except Exception: ohe_feat_names = []
-
-feature_names = list(numeric_feats) + ohe_feat_names
-
-# RandomForest feature importances if "RandomForest" in models:
-rf = models["RandomForest"][0].named_steps["regressor"] try:
-importances = rf.feature_importances_
-plot_feature_importances(feature_names, importances, out_dir / "rf_feature_importance.png", top_n=25)
-print("Saved RandomForest feature importance plot.") except Exception as e:
-print("Could not plot RF importances:", e)
-
-if "XGBoost" in models and XGBRegressor is not None: xgb = models["XGBoost"][0].named_steps["regressor"] try:
-importances = xgb.feature_importances_
-plot_feature_importances(feature_names, importances, out_dir / "xgb_feature_importance.png", top_n=25)
- 
-print("Saved XGBoost feature importance plot.") except Exception as e:
-print("Could not plot XGB importances:", e) print("\nAll done. Outputs saved to:", out_dir)
-
-if 	name	== "	main	":
-parser = argparse.ArgumentParser(description="House Price Prediction - training script")
-parser.add_argument("--csv", type=str, required=True, help="Path to dataset CSV (must include target column)")
-parser.add_argument("--target", type=str, default="SalePrice", help="Name of target column in CSV")
-parser.add_argument("--output-dir", type=str, default="output", help="Directory to save outputs")
-parser.add_argument("--test-size", type=float, default=0.2, help="Test set fraction")
-parser.add_argument("--tune", action="store_true", help="Perform GridSearch hyperparameter tuning (slower)")
-args = parser.parse_args() main(args)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Email Spam Detection - training script")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="data",
+        help="Base data directory containing 'ham' and 'spam' subfolders with .eml/.txt files",
+    )
+    parser.add_argument("--output-dir", type=str, default="output", help="Directory to save models and plots")
+    parser.add_argument("--test-size", type=float, default=0.20, help="Test split fraction")
+    parser.add_argument("--max-features", type=int, default=3000, help="Max features for TF-IDF")
+    parser.add_argument("--no-grid", action="store_true", help="Disable GridSearch (faster)")
+    args = parser.parse_args()
+    main(args)
